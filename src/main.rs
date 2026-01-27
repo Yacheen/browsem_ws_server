@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-use crate::{server::{MessageContent, ServerMessage}, session::UserSession};
+use crate::{server::ServerMessage, session::UserSession};
 
 mod server;
 mod session;
@@ -26,9 +26,11 @@ async fn ws(req: HttpRequest, body: web::Payload, ws_server_tx: web::Data<Sender
     
     // remove Actix's Data's inner (arc) cause channels already reference count
     let (session_tx, mut session_rx) = mpsc::channel::<ServerMessage>(1024);
-    let user_session = Arc::new(tokio::sync::Mutex::new(UserSession::new(Arc::into_inner(ws_server_tx.clone().into_inner()).unwrap())));
+    let user_session = Arc::new(tokio::sync::Mutex::new(UserSession::new(
+        Arc::into_inner(ws_server_tx.clone().into_inner()).unwrap(),
+    )));
 
-    // check if heartbeat died
+    // check if heartbeat died, cleanup after dieded
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
 
@@ -45,50 +47,36 @@ async fn ws(req: HttpRequest, body: web::Payload, ws_server_tx: web::Data<Sender
         }
     });
 
-    // one place to handle client messages (uses ws_server_tx),
+    // handle messages from client and send to server (uses ws_server_tx),
     let user_session2 = user_session.clone();
+    let session_tx2 = session_tx.clone();
     tokio::task::spawn_local(async move {
         while let Some(Ok(msg)) = stream.recv().await {
-            user_session2.lock().await.handle_message_from_client(msg, session.clone(), alive.clone()).await;
+            user_session2.lock().await.handle_message_from_client(msg, session.clone(), alive.clone(), session_tx2.clone()).await;
         }
         let _ = session.close(None).await;
     });
 
-    // one place to handle server messages (gives server a session_tx),
+    // handle msges from server and send to client (gives server a session_tx),
     let user_session3 = user_session.clone();
+    let session_tx3 = session_tx.clone();
     tokio::task::spawn_local(async move {
         while let Some(msg) = session_rx.recv().await {
-            user_session3.lock().await.handle_message_from_server(msg).await;
+            user_session3.lock().await.handle_message_from_server(msg, session_tx3.clone()).await;
         }
     });
+
     let user_session4 = user_session.clone();
     tokio::spawn(async move {
-        let (oneshot_tx, oneshot_rx) = oneshot::channel();
         let user_session4 = user_session4.lock().await;
-
-        ws_server_tx.clone().send(ServerMessage {
-            message_content: MessageContent::Connect {
-                session_id: user_session4.session_id,
-                session_tx: session_tx.clone(),
-                settings: user_session4.settings.clone(),
-                user_details: user_session4.user_details.clone()
-            },
-            responder: Some(oneshot_tx)
+        ws_server_tx.clone().send(ServerMessage::Connect {
+            session_id: user_session4.session_id,
+            session_tx: session_tx.clone(),
+            settings: user_session4.settings.clone(),
+            user_details: user_session4.user_details.clone()
         }).await.unwrap();
-        match oneshot_rx.await {
-            Ok(response) => {
-                println!("send connected message to server.");
-            }
-            Err(something) => {
-                println!("Problem waiting for connect to server response: {:#?}", something);
-            }
-        }
     });
     
-
-    // connect to ws server, send it ur transceiver
-    
-
     tracing::info!("Spawned");
 
     Ok(response)

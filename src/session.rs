@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 
-use crate::server::{MessageContent, ServerMessage};
+use crate::server::ServerMessage;
 
 #[derive(Deserialize)]
 pub enum ClientMessage {
-    Connect
+    Connect,
+    Disconnect
 }
 #[derive(Clone)]
 struct Chatter {
@@ -47,6 +48,7 @@ impl UserSession {
         stream: AggregatedMessage,
         mut session: actix_ws::Session,
         alive: Arc<tokio::sync::Mutex<Instant>>,
+        session_tx: Sender<ServerMessage>,
     ) {
         match stream {
             AggregatedMessage::Ping(bytes) => {
@@ -65,21 +67,31 @@ impl UserSession {
             AggregatedMessage::Pong(_) => {
                 *alive.lock().await = Instant::now();
             }
+            // send server msg
             AggregatedMessage::Binary(msg) => {
-                // match serde_json::from_slice::<session::ClientMessage>(&msg) {
-                //     Ok(deserialized_message) => {
-                //         ws_server_tx.send(ServerMessage {
-                //             message_content: MessageContent::Connect(session.)
-                //         })
-                //     }
-                //     Err(err) => {
-                //         println!("Problem deserializing binary msg: {:#?}", err);
-                //     }
-                // }
+                match serde_json::from_slice::<ClientMessage>(&msg) {
+                    Ok(deserialized_message) => {
+                        match deserialized_message {
+                            ClientMessage::Disconnect => {
+                                self.ws_server_tx.send(ServerMessage::Disconnect { session_id: self.session_id, session_tx: session_tx });
+
+                            }
+                            _ => (),
+                        }
+                    }
+                    Err(err) => {
+                        println!("Problem deserializing binary msg: {:#?}", err);
+                    }
+                }
             }
         }
     }
-    pub async fn handle_message_from_server(&mut self, msg: ServerMessage) {
+    pub async fn handle_message_from_server(
+        &mut self,
+        msg: ServerMessage,
+        session_tx: Sender<ServerMessage>,
+    ) {
+
     }
 }
 #[derive(Clone)]
