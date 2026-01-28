@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 
-use crate::session::{Settings, UserDetails};
+use crate::session::{ClientMessage, Settings, UserDetails};
 
 
 pub struct WsServer {
-    sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, Sender<ServerMessage>>>>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, (Chatter, Sender<ClientMessage>)>>>,
     ws_server_rx: Receiver<ServerMessage>,
 }
 impl WsServer {
@@ -22,14 +23,29 @@ impl WsServer {
     pub async fn handle_ws_messages(&mut self) {
         while let Some(message) = self.ws_server_rx.recv().await {
             match message {
-                ServerMessage::Connect { session_id, settings, session_tx, user_details } => {
+                ServerMessage::Connect { chatter, session_tx } => {
                     tracing::info!("user trying to connect to sever");
-                    let _ = self.sessions.lock().await.insert(session_id, session_tx);
+                    let online_sessions: u32;
+                    {
+                        let mut sessions = self.sessions.lock().await;
+                        let _ = sessions.insert(chatter.session_id, (chatter.clone(), session_tx.clone()));
+                        online_sessions = sessions.len() as u32;
+                    }
+                    session_tx.send(ClientMessage::Connected {
+                        session_id: chatter.session_id,
+                        online_sessions,
+                    }).await.unwrap();
                 }
                 ServerMessage::Disconnect { session_id, session_tx } => {
                     tracing::info!("user trying to disconnect to sever");
-                    if let Some(sesh) = self.sessions.lock().await.remove(&session_id) {
-                        sesh.send(ServerMessage::Disconnected).await.unwrap();
+                    if let Some((_chatter, _)) = self.sessions.lock().await.remove(&session_id) {
+                        session_tx.send(ClientMessage::Disconnected).await.unwrap();
+                    }
+                },
+                ServerMessage::UpdateInfo { username, settings, session_id } => {
+                    if let Some((chatter, _)) = self.sessions.lock().await.get_mut(&session_id) {
+                        chatter.username = username;
+                        chatter.settings = settings;
                     }
                 }
                 _ => (),
@@ -37,18 +53,26 @@ impl WsServer {
         }
     }
 }
+#[derive(Debug)]
 pub enum ServerMessage {
     Connect {
-        session_id: Uuid,
-        session_tx: Sender<ServerMessage>,
-        settings: Option<Settings>,
-
-        // logged in
-        user_details: Option<UserDetails>,
+        chatter: Chatter,
+        session_tx: Sender<ClientMessage>,
     },
     Disconnect {
         session_id: Uuid,
-        session_tx: Sender<ServerMessage>,
+        session_tx: Sender<ClientMessage>,
     },
-    Disconnected
+    UpdateInfo {
+        username: String,
+        settings: Option<Settings>,
+        session_id: Uuid
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Chatter {
+    pub username: String,
+    pub profile_picture_key: Option<String>,
+    pub session_id: Uuid,
+    pub settings: Option<Settings>,
 }

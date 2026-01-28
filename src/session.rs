@@ -1,40 +1,47 @@
 use std::{sync::Arc, time::Instant};
 
-use actix_ws::{AggregatedMessage, AggregatedMessageStream};
+use actix_ws::{AggregatedMessage, AggregatedMessageStream, CloseReason};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 
-use crate::server::ServerMessage;
+use crate::server::{Chatter, ServerMessage};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub enum ClientMessage {
     Connect,
-    Disconnect
-}
-#[derive(Clone)]
-struct Chatter {
-    username: String,
-    profile_picture_key: String,
+    #[serde(rename_all = "camelCase")]
+    Connected {
+        online_sessions: u32,
+        session_id: Uuid,
+    },
+    Disconnect,
+    Disconnected,
+    UpdateInfo {
+        username: String,
+        settings: Option<Settings>,
+    }
 }
 pub struct UserSession {
     pub session_id: Uuid,
-    pub ws_server_tx: Sender<ServerMessage>,
+    pub username: String,
+    pub ws_server_tx: Arc<Sender<ServerMessage>>,
     pub settings: Option<Settings>,
     pub current_call: Option<Uuid>,
 
     // if logged in
     pub user_details: Option<UserDetails>,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UserDetails {
-    pub chatter: Chatter,
+    pub profile_picture_key: String,
     pub claims: Claims,
 }
 impl UserSession {
-    pub fn new(ws_server_tx: Sender<ServerMessage>) -> Self {
+    pub fn new(ws_server_tx: Arc<Sender<ServerMessage>>) -> Self {
         Self {
             session_id: Uuid::new_v4(),
+            username: String::new(),
             ws_server_tx,
             settings: None,
             current_call: None,
@@ -48,7 +55,7 @@ impl UserSession {
         stream: AggregatedMessage,
         mut session: actix_ws::Session,
         alive: Arc<tokio::sync::Mutex<Instant>>,
-        session_tx: Sender<ServerMessage>,
+        session_tx: Sender<ClientMessage>,
     ) {
         match stream {
             AggregatedMessage::Ping(bytes) => {
@@ -57,11 +64,31 @@ impl UserSession {
                 }
             }
             AggregatedMessage::Text(string) => {
-                tracing::info!("Not accepting strings!");
+                match serde_json::from_str::<ClientMessage>(&string) {
+                    Ok(deserialized_message) => {
+                        tracing::info!("Message from client: {:#?}", deserialized_message);
+                        match deserialized_message {
+                            ClientMessage::Disconnect => {
+                                let _ = self.ws_server_tx.send(ServerMessage::Disconnect { session_id: self.session_id, session_tx: session_tx }).await;
+                            }
+                            ClientMessage::UpdateInfo { username, settings } => {
+                                self.settings = settings.clone();
+                                self.username = username.clone();
+                                let _ = self.ws_server_tx.send(ServerMessage::UpdateInfo { username, settings, session_id: self.session_id }).await;
+
+                            }
+                            _ => (),
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("Problem deserializing string msg from client: {:#?}", err);
+                    }
+                }
             }
             AggregatedMessage::Close(reason) => {
-                let _ = session.close(reason).await;
-                tracing::info!("Got close, bailing");
+                let _ = session.close(reason.clone()).await;
+                tracing::info!("Got close, reason: {:#?}", reason);
+                self.ws_server_tx.send(ServerMessage::Disconnect { session_id: self.session_id, session_tx }).await.unwrap();
                 return;
             }
             AggregatedMessage::Pong(_) => {
@@ -69,46 +96,43 @@ impl UserSession {
             }
             // send server msg
             AggregatedMessage::Binary(msg) => {
-                match serde_json::from_slice::<ClientMessage>(&msg) {
-                    Ok(deserialized_message) => {
-                        match deserialized_message {
-                            ClientMessage::Disconnect => {
-                                self.ws_server_tx.send(ServerMessage::Disconnect { session_id: self.session_id, session_tx: session_tx });
-
-                            }
-                            _ => (),
-                        }
-                    }
-                    Err(err) => {
-                        println!("Problem deserializing binary msg: {:#?}", err);
-                    }
-                }
+                tracing::warn!("Someones trying to send binary. Uh ohhhhhhhh.");
             }
         }
     }
     pub async fn handle_message_from_server(
         &mut self,
-        msg: ServerMessage,
-        session_tx: Sender<ServerMessage>,
+        msg: ClientMessage,
+        mut session: actix_ws::Session,
     ) {
-
+        tracing::info!("message from server: {:#?}", msg);
+        send_client_message(msg, session).await;
     }
 }
-#[derive(Clone)]
-struct Claims {
+async fn send_client_message(msg: ClientMessage, mut session: actix_ws::Session) {
+    match serde_json::to_string(&msg) {
+        Ok(serialized_msg) => {
+            if session.text(serialized_msg.clone()).await.is_err() {
+                tracing::warn!("Err sending serialized msg to client: session closed.");
+                tracing::warn!("Message: {:?}", serialized_msg);
+            };
+        }
+        Err(err) => {
+            tracing::error!("Problem serializing server msg for client: {:#?}", msg);
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Claims {
     // id: ,
-    exp: usize,
+    pub exp: usize,
 }
 struct CallMeta {
     pub owner: Chatter,
     pub call_name: String,
     pub session_id: Uuid,
-    pub connected_chatters: Vec<LiveChatter>,
+    pub connected_chatters: Vec<Chatter>,
     pub created_at: f64,
-}
-struct LiveChatter {
-    session_id: Uuid,
-    chatter: Chatter,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -117,6 +141,5 @@ pub struct Settings {
     pub microphone_is_on: bool,
     pub camera_is_on: bool,
     pub sharing_screen: bool,
-    pub global_muted: bool,
     pub deafened: bool,
 }
