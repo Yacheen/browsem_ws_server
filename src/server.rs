@@ -8,9 +8,18 @@ use uuid::Uuid;
 
 use crate::session::{ClientMessage, Settings, UserDetails};
 
+struct ChatterChannel {
+    session_id: Uuid,
+    channel_name: String,
+    channel_owner: String,
+    chatters: Vec<Chatter>,
+    url_origin: String,
+    full_url: String,
+}
 
 pub struct WsServer {
     sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, (Chatter, Sender<ClientMessage>)>>>,
+    channels: Arc<tokio::sync::Mutex<HashMap<String, ChatterChannel>>>,
     ws_server_rx: Receiver<ServerMessage>,
 }
 impl WsServer {
@@ -42,11 +51,15 @@ impl WsServer {
                         session_tx.send(ClientMessage::Disconnected).await.unwrap();
                     }
                 },
-                ServerMessage::UpdateInfo { username, settings, session_id } => {
+                ServerMessage::UpdateInfo { username, settings, session_id, current_origin, current_url } => {
                     if let Some((chatter, _)) = self.sessions.lock().await.get_mut(&session_id) {
                         chatter.username = username;
                         chatter.settings = settings;
+                        chatter
                     }
+                }
+                ServerMessage::CreateChannel { session_id, channel_owner, channel_name, max_chatters, url_origin, full_url } => {
+
                 }
                 _ => (),
             }
@@ -66,7 +79,17 @@ pub enum ServerMessage {
     UpdateInfo {
         username: String,
         settings: Option<Settings>,
-        session_id: Uuid
+        session_id: Uuid,
+        current_url: Option<String>,
+        current_origin: Option<String>,
+    },
+    CreateChannel {
+        session_id: Uuid,
+        channel_owner: String,
+        channel_name: String,
+        max_chatters: u16
+        url_origin: String,
+        full_url: String,
     }
 }
 #[derive(Clone, Debug)]

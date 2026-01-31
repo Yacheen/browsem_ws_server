@@ -20,7 +20,25 @@ pub enum ClientMessage {
     UpdateInfo {
         username: String,
         settings: Option<Settings>,
+        current_url: Option<String>,
+        current_origin: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CreateChannel {
+        channel_name: String,
+        max_chatters: u16,
+        url_origin: String,
+        full_url: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    ErrorMessage {
+       error_message: ErrorType, 
     }
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ErrorType {
+    NoChannelName(String),
+    ChannelNameTooLong(String),
 }
 pub struct UserSession {
     pub session_id: Uuid,
@@ -28,6 +46,8 @@ pub struct UserSession {
     pub ws_server_tx: Arc<Sender<ServerMessage>>,
     pub settings: Option<Settings>,
     pub current_call: Option<Uuid>,
+    pub current_url: Option<String>,
+    pub current_origin: Option<String>,
 
     // if logged in
     pub user_details: Option<UserDetails>,
@@ -43,8 +63,12 @@ impl UserSession {
             session_id: Uuid::new_v4(),
             username: String::new(),
             ws_server_tx,
+
+            // whenever popup opens, sends msg to server of what these currently are
             settings: None,
             current_call: None,
+            current_origin: None,
+            current_url: None,
 
             // logged in
             user_details: None,
@@ -71,11 +95,33 @@ impl UserSession {
                             ClientMessage::Disconnect => {
                                 let _ = self.ws_server_tx.send(ServerMessage::Disconnect { session_id: self.session_id, session_tx: session_tx }).await;
                             }
-                            ClientMessage::UpdateInfo { username, settings } => {
+                            ClientMessage::UpdateInfo { username, settings, current_origin, current_url } => {
                                 self.settings = settings.clone();
                                 self.username = username.clone();
-                                let _ = self.ws_server_tx.send(ServerMessage::UpdateInfo { username, settings, session_id: self.session_id }).await;
+                                self.current_origin = current_origin.clone();
+                                self.current_url = current_url.clone();
+                                let _ = self.ws_server_tx.send(ServerMessage::UpdateInfo { username, settings, session_id: self.session_id, current_url, current_origin }).await;
 
+                            }
+                            ClientMessage::CreateChannel { channel_name, max_chatters, url_origin, full_url } => {
+                                if channel_name.len() > 0 {
+                                    let _ = self.ws_server_tx.send(ServerMessage::CreateChannel {
+                                        session_id: self.session_id,
+                                        channel_name,
+                                        full_url,
+                                        url_origin,
+                                        max_chatters,
+                                        channel_owner: self.username.clone()
+                                    }).await;
+                                }
+                                else if channel_name.len() > 50 {
+                                    let msg = ClientMessage::ErrorMessage { error_message: ErrorType::ChannelNameTooLong("Channel name required".to_string())};
+                                    send_client_message(msg, session).await;
+                                }
+                                else if channel_name.len() == 0 {
+                                    let msg = ClientMessage::ErrorMessage { error_message: ErrorType::NoChannelName("Channel name may not exceed 50 characters.".to_string()) };
+                                    send_client_message(msg, session).await;
+                                }
                             }
                             _ => (),
                         }
